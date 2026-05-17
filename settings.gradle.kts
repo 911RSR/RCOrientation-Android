@@ -22,5 +22,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "RC_orientation_app"
+rootProject.name = "RCOrientation-Android"
 include(":app")
+

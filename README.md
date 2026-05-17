@@ -1,4 +1,4 @@
-# RC_orientation_app
+# RCOrientation-Android
 
 Android controller app for sending a phone's orientation to one or more STM32WB boards over Bluetooth Low Energy.
 
@@ -50,4 +50,5 @@ uint16_t sequence;
 
 Built with Android Studio and Kotlin / Jetpack Compose.
 
-The companion STM32WB firmware project is `RC_orientation_STM32WB`.
+The companion STM32WB firmware project is `RCOrientation-STM32WB`.
+
