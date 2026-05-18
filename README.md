@@ -71,16 +71,6 @@ Open the project in Android Studio and run it on a real phone, or build from the
 
 GitHub Actions also builds the Android project on every push and pull request.
 
-## Sharing the app
-
-For direct sharing outside Google Play, create a signed release APK in Android Studio:
-
-```text
-Build -> Generate Signed Bundle / APK -> APK
-```
-
-Keep the signing key safe; updates must be signed with the same key to install over an earlier version.
-
 ## Security note
 
 The companion receiver requires bonded encrypted BLE access. The current first-pairing mode is intentionally simple and does not provide man-in-the-middle protection during the first pairing ceremony.
