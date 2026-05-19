@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -19,6 +20,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -54,6 +56,7 @@ import androidx.core.content.ContextCompat
 import com.example.rc_orientation_app.ui.theme.RC_orientation_appTheme
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 import java.util.UUID
 import kotlin.math.roundToInt
 
@@ -65,12 +68,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private val bleScanner by lazy { bluetoothAdapter.bluetoothLeScanner }
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private var absoluteRollDeg by mutableStateOf(0f)
-    private var absolutePitchDeg by mutableStateOf(0f)
-    private var absoluteYawDeg by mutableStateOf(0f)
-    private var zeroRollDeg by mutableStateOf(0f)
-    private var zeroPitchDeg by mutableStateOf(0f)
-    private var zeroYawDeg by mutableStateOf(0f)
+    private var absoluteRollDeg = 0f
+    private var absolutePitchDeg = 0f
+    private var absoluteYawDeg = 0f
+    private var zeroRollDeg = 0f
+    private var zeroPitchDeg = 0f
+    private var zeroYawDeg = 0f
+    private var displayRollDeg by mutableStateOf(0f)
+    private var displayPitchDeg by mutableStateOf(0f)
+    private var displayYawDeg by mutableStateOf(0f)
     private var sensorAvailable by mutableStateOf(true)
     private var permissionsGranted by mutableStateOf(false)
     private var isScanning by mutableStateOf(false)
@@ -79,8 +85,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var sequenceNumber = 0
     private var lastSensorEventNs = 0L
     private var lastCommandSendNs = 0L
-    private var sensorPeriodMs by mutableStateOf<Float?>(null)
-    private var commandPeriodMs by mutableStateOf<Float?>(null)
+    private var latestSensorPeriodMs: Float? = null
+    private var latestCommandPeriodMs: Float? = null
+    private var displaySensorPeriodMs by mutableStateOf<Float?>(null)
+    private var displayCommandPeriodMs by mutableStateOf<Float?>(null)
+    private var lastTelemetryUiUpdateNs = 0L
 
     private val pairedDevices = mutableStateListOf<BleDeviceItem>()
     private val discoveredDevices = mutableStateListOf<BleDeviceItem>()
@@ -88,6 +97,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private val bluetoothGatts = mutableMapOf<String, BluetoothGatt>()
     private val orientationChars = mutableMapOf<String, BluetoothGattCharacteristic>()
     private val servoFeedbackChars = mutableMapOf<String, BluetoothGattCharacteristic>()
+    private val latestFeedbackByAddress = mutableMapOf<String, ServoFeedbackSnapshot>()
+    private val manuallyDisconnectedAddresses = mutableSetOf<String>()
+    private val reconnectAttemptsByAddress = mutableMapOf<String, Int>()
 
     private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         permissionsGranted = hasBlePermissions()
@@ -104,11 +116,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 null
             }
             val name = advertisedName ?: cachedName ?: "Unnamed BLE device"
+            val advertisesOrientationService = result.scanRecord?.serviceUuids
+                ?.any { it.uuid == ORIENTATION_SERVICE_UUID } == true
             val existingIndex = discoveredDevices.indexOfFirst { it.address == address }
+            val item = BleDeviceItem(name, address, device, advertisesOrientationService)
             if (existingIndex >= 0) {
-                discoveredDevices[existingIndex] = BleDeviceItem(name, address, device)
+                discoveredDevices[existingIndex] = item
             } else {
-                discoveredDevices.add(BleDeviceItem(name, address, device))
+                discoveredDevices.add(item)
             }
         }
     }
@@ -125,11 +140,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             RC_orientation_appTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     MainScreen(
-                        rollDeg = currentRollDeg(),
-                        pitchDeg = currentPitchDeg(),
-                        yawDeg = currentYawDeg(),
-                        sensorPeriodMs = sensorPeriodMs,
-                        commandPeriodMs = commandPeriodMs,
+                        rollDeg = displayRollDeg,
+                        pitchDeg = displayPitchDeg,
+                        yawDeg = displayYawDeg,
+                        sensorPeriodMs = displaySensorPeriodMs,
+                        commandPeriodMs = displayCommandPeriodMs,
                         sensorAvailable = sensorAvailable,
                         permissionsGranted = permissionsGranted,
                         isScanning = isScanning,
@@ -173,7 +188,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onSensorChanged(event: SensorEvent) {
         if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
         if (lastSensorEventNs != 0L) {
-            sensorPeriodMs = (event.timestamp - lastSensorEventNs) / 1_000_000f
+            latestSensorPeriodMs = (event.timestamp - lastSensorEventNs) / 1_000_000f
         }
         lastSensorEventNs = event.timestamp
         val rotationMatrix = FloatArray(9)
@@ -184,12 +199,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         absolutePitchDeg = Math.toDegrees(orientationAngles[1].toDouble()).toFloat()
         absoluteRollDeg = Math.toDegrees(orientationAngles[2].toDouble()).toFloat()
         broadcastOrientationPacket()
+        maybePublishTelemetryUi()
     }
 
     private fun zeroCurrentOrientation() {
         zeroRollDeg = absoluteRollDeg
         zeroPitchDeg = absolutePitchDeg
         zeroYawDeg = absoluteYawDeg
+        publishTelemetryToUi()
     }
 
     private fun currentRollDeg() = relativeAngle(absoluteRollDeg, zeroRollDeg)
@@ -246,16 +263,21 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         if (!hasConnectPermission()) return
         try {
             bluetoothAdapter.bondedDevices.forEach { device ->
-                pairedDevices.add(BleDeviceItem(device.name ?: "Unnamed paired device", device.address, device))
+                val advertisesOrientationService = discoveredDevices
+                    .firstOrNull { it.address == device.address }
+                    ?.advertisesOrientationService == true
+                pairedDevices.add(BleDeviceItem(device.name ?: "Unnamed paired device", device.address, device, advertisesOrientationService))
             }
         } catch (_: SecurityException) {}
     }
 
     private fun visiblePairedDevices(): List<BleDeviceItem> = pairedDevices
+        .filter { isRcOrientationCandidate(it) }
         .filter { !connectedDevices.containsKey(it.address) }
         .sortedWith(compareBy<BleDeviceItem> { it.name.lowercase() }.thenBy { it.address })
 
     private fun visibleDiscoveredDevices(): List<BleDeviceItem> = discoveredDevices
+        .filter { isRcOrientationCandidate(it) }
         .filter { !connectedDevices.containsKey(it.address) }
         .filter { pairedDevices.none { paired -> paired.address == it.address } }
         .sortedWith(
@@ -264,12 +286,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 .thenBy { it.address }
         )
 
+    private fun isRcOrientationCandidate(item: BleDeviceItem): Boolean =
+        item.advertisesOrientationService || item.name.startsWith(RC_DEVICE_NAME, ignoreCase = true)
+
     private fun connectToDevice(item: BleDeviceItem) {
         if (!hasConnectPermission()) {
             requestBlePermissions()
             return
         }
         if (bluetoothGatts.containsKey(item.address)) return
+        manuallyDisconnectedAddresses.remove(item.address)
+        reconnectAttemptsByAddress.remove(item.address)
         connectedDevices[item.address] = ConnectedBleDevice(item.name, item.address, "Connecting...")
         showDeviceSelection = false
         showNearbyDevices = false
@@ -284,26 +311,44 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun createGattCallback(address: String) = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            runOnUiThread {
-                connectedDevices[address] = connectedDevices[address]?.copy(
-                    status = when (newState) {
-                        BluetoothProfile.STATE_CONNECTED -> "Connected, discovering service..."
-                        BluetoothProfile.STATE_CONNECTING -> "Connecting..."
-                        BluetoothProfile.STATE_DISCONNECTED -> "Disconnected"
-                        else -> "State $newState"
+            when (newState) {
+                BluetoothProfile.STATE_CONNECTED -> {
+                    reconnectAttemptsByAddress.remove(address)
+                    runOnUiThread {
+                        connectedDevices[address] = connectedDevices[address]?.copy(status = "Connected, discovering service...")
+                            ?: return@runOnUiThread
                     }
-                ) ?: return@runOnUiThread
-            }
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                try {
-                    gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                    gatt.discoverServices()
-                } catch (_: SecurityException) {}
-            }
-            if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                orientationChars.remove(address)
-                servoFeedbackChars.remove(address)
-                bluetoothGatts.remove(address)
+                    try {
+                        gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                        gatt.discoverServices()
+                    } catch (_: SecurityException) {}
+                }
+
+                BluetoothProfile.STATE_CONNECTING -> runOnUiThread {
+                    connectedDevices[address] = connectedDevices[address]?.copy(status = "Connecting...")
+                        ?: return@runOnUiThread
+                }
+
+                BluetoothProfile.STATE_DISCONNECTED -> {
+                    orientationChars.remove(address)
+                    servoFeedbackChars.remove(address)
+                    bluetoothGatts.remove(address)
+                    try { gatt.close() } catch (_: SecurityException) {}
+                    runOnUiThread {
+                        latestFeedbackByAddress.remove(address)
+                        if (manuallyDisconnectedAddresses.remove(address) || !connectedDevices.containsKey(address)) {
+                            return@runOnUiThread
+                        }
+                        connectedDevices[address] = connectedDevices[address]?.copy(status = "Reconnecting...")
+                            ?: return@runOnUiThread
+                        scheduleReconnect(address, gatt.device)
+                    }
+                }
+
+                else -> runOnUiThread {
+                    connectedDevices[address] = connectedDevices[address]?.copy(status = "State $newState")
+                        ?: return@runOnUiThread
+                }
             }
         }
 
@@ -331,10 +376,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val sequence = buffer.short.toInt() and 0xFFFF
             val feedbackNowNs = System.nanoTime()
             runOnUiThread {
-                val previous = connectedDevices[address] ?: return@runOnUiThread
-                val feedbackPeriodMs = previous.lastFeedbackNs?.let { (feedbackNowNs - it) / 1_000_000f }
-                val sequenceStep = previous.lastSequence?.let { (sequence - it + 65536) and 0xFFFF }
-                connectedDevices[address] = previous.copy(
+                val previousFeedback = latestFeedbackByAddress[address]
+                val feedbackPeriodMs = previousFeedback?.lastFeedbackNs?.let { (feedbackNowNs - it) / 1_000_000f }
+                val sequenceStep = previousFeedback?.lastSequence?.let { (sequence - it + 65536) and 0xFFFF }
+                latestFeedbackByAddress[address] = ServoFeedbackSnapshot(
                     servo0Us = servo0Us,
                     servo1Us = servo1Us,
                     servo2Us = servo2Us,
@@ -344,6 +389,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     feedbackPeriodMs = feedbackPeriodMs,
                     sequenceStep = sequenceStep
                 )
+                maybePublishTelemetryUi(feedbackNowNs)
             }
         }
     }
@@ -361,7 +407,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         if (!hasConnectPermission() || orientationChars.isEmpty()) return
         val nowNs = System.nanoTime()
         if (lastCommandSendNs != 0L) {
-            commandPeriodMs = (nowNs - lastCommandSendNs) / 1_000_000f
+            latestCommandPeriodMs = (nowNs - lastCommandSendNs) / 1_000_000f
         }
         lastCommandSendNs = nowNs
         val sequence = sequenceNumber++ and 0xFFFF
@@ -381,19 +427,70 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
+    private fun scheduleReconnect(address: String, device: BluetoothDevice) {
+        val attempt = (reconnectAttemptsByAddress[address] ?: 0) + 1
+        reconnectAttemptsByAddress[address] = attempt
+        val delayMs = (attempt * 1_000L).coerceAtMost(5_000L)
+        mainHandler.postDelayed({
+            if (!connectedDevices.containsKey(address) || bluetoothGatts.containsKey(address)) return@postDelayed
+            if (!hasConnectPermission()) {
+                permissionsGranted = false
+                connectedDevices[address]?.let { connectedDevices[address] = it.copy(status = "BLE permission needed") }
+                return@postDelayed
+            }
+            val selectedDevice = connectedDevices[address] ?: return@postDelayed
+            connectedDevices[address] = selectedDevice.copy(status = "Reconnecting...")
+            try {
+                bluetoothGatts[address] = device.connectGatt(this, false, createGattCallback(address))
+            } catch (_: SecurityException) {
+                permissionsGranted = false
+                connectedDevices[address]?.let { connectedDevices[address] = it.copy(status = "BLE permission needed") }
+            }
+        }, delayMs)
+    }
+
     private fun disconnectDevice(address: String) {
-        val gatt = bluetoothGatts[address]
+        manuallyDisconnectedAddresses.add(address)
+        reconnectAttemptsByAddress.remove(address)
+        val gatt = bluetoothGatts.remove(address)
+        orientationChars.remove(address)
+        servoFeedbackChars.remove(address)
+        latestFeedbackByAddress.remove(address)
+        connectedDevices.remove(address)
+        refreshPairedDevices()
+        showDeviceSelection = true
+        showNearbyDevices = false
+        stopScan()
         try {
             gatt?.disconnect()
             gatt?.close()
         } catch (_: SecurityException) {}
-        bluetoothGatts.remove(address)
-        orientationChars.remove(address)
-        servoFeedbackChars.remove(address)
-        connectedDevices.remove(address)
-        refreshPairedDevices()
-        if (connectedDevices.isEmpty()) {
-            showDeviceSelection = true
+    }
+
+    private fun maybePublishTelemetryUi(nowNs: Long = System.nanoTime()) {
+        if (lastTelemetryUiUpdateNs != 0L && nowNs - lastTelemetryUiUpdateNs < UI_UPDATE_INTERVAL_NS) return
+        lastTelemetryUiUpdateNs = nowNs
+        publishTelemetryToUi()
+    }
+
+    private fun publishTelemetryToUi() {
+        displayRollDeg = currentRollDeg()
+        displayPitchDeg = currentPitchDeg()
+        displayYawDeg = currentYawDeg()
+        displaySensorPeriodMs = latestSensorPeriodMs
+        displayCommandPeriodMs = latestCommandPeriodMs
+        latestFeedbackByAddress.forEach { (address, feedback) ->
+            val previous = connectedDevices[address] ?: return@forEach
+            connectedDevices[address] = previous.copy(
+                servo0Us = feedback.servo0Us,
+                servo1Us = feedback.servo1Us,
+                servo2Us = feedback.servo2Us,
+                servo3Us = feedback.servo3Us,
+                lastSequence = feedback.lastSequence,
+                lastFeedbackNs = feedback.lastFeedbackNs,
+                feedbackPeriodMs = feedback.feedbackPeriodMs,
+                sequenceStep = feedback.sequenceStep
+            )
         }
     }
 
@@ -415,11 +512,29 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         private val ORIENTATION_COMMAND_CHAR_UUID = UUID.fromString("00000001-0000-1000-8000-00805f9b34fb")
         private val SERVO_FEEDBACK_CHAR_UUID = UUID.fromString("00000002-0000-1000-8000-00805f9b34fb")
         private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private const val RC_DEVICE_NAME = "RCOrient"
         private const val SENSOR_PERIOD_US = 10_000
+        private const val UI_UPDATE_INTERVAL_NS = 100_000_000L
     }
 }
 
-data class BleDeviceItem(val name: String, val address: String, val device: BluetoothDevice)
+data class BleDeviceItem(
+    val name: String,
+    val address: String,
+    val device: BluetoothDevice,
+    val advertisesOrientationService: Boolean = false
+)
+data class ServoFeedbackSnapshot(
+    val servo0Us: Int,
+    val servo1Us: Int,
+    val servo2Us: Int,
+    val servo3Us: Int,
+    val lastSequence: Int,
+    val lastFeedbackNs: Long,
+    val feedbackPeriodMs: Float?,
+    val sequenceStep: Int?
+)
+
 data class ConnectedBleDevice(
     val name: String,
     val address: String,
@@ -479,10 +594,16 @@ fun MainScreen(
                             Text(item.name, fontWeight = FontWeight.Bold)
                             Text("${item.address} • ${item.status}", style = MaterialTheme.typography.bodySmall)
                         }
-                        Button(onClick = { onDisconnectClick(item.address) }) { Text("Disconnect") }
+                        Button(onClick = { onDisconnectClick(item.address) }) {
+                            Text(if (item.status == "Ready") "Disconnect" else "De-select")
+                        }
                     }
-                    ServoRow(item, modifier = Modifier.padding(top = 4.dp))
-                    FeedbackRow(item.feedbackPeriodMs, item.sequenceStep, modifier = Modifier.padding(top = 4.dp))
+                    if (item.hasServoFeedback()) {
+                        ServoRow(item, modifier = Modifier.padding(top = 8.dp))
+                        FeedbackRow(item, modifier = Modifier.padding(top = 4.dp))
+                    } else {
+                        Text("Waiting for servo feedback...", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+                    }
                 }
             }
         }
@@ -494,7 +615,7 @@ fun MainScreen(
             }
         }
         if (showDeviceSelection && permissionsGranted) {
-            Text("Paired receivers", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 20.dp))
+            Text("Paired RCOrientation receivers", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 20.dp))
             if (pairedDevices.isEmpty()) {
                 Text("None", modifier = Modifier.padding(top = 8.dp))
             } else {
@@ -510,7 +631,7 @@ fun MainScreen(
             }
         }
         if (showDeviceSelection && showNearbyDevices) {
-            Text("Nearby unpaired devices", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 20.dp))
+            Text("Nearby RCOrientation receivers", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 20.dp))
             Text(if (isScanning) "Scanning..." else "Scan stopped", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
             LazyColumn(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
                 items(discoveredDevices, key = { it.address }) { item ->
@@ -525,48 +646,86 @@ fun MainScreen(
 }
 
 @Composable
+private fun NumericText(text: String, modifier: Modifier = Modifier, large: Boolean = false) {
+    val baseStyle = if (large) MaterialTheme.typography.bodyLarge else MaterialTheme.typography.bodySmall
+    Row(modifier = modifier, horizontalArrangement = Arrangement.End) {
+        text.forEach { character ->
+            Text(
+                text = character.toString(),
+                style = baseStyle.copy(fontFamily = FontFamily.Monospace),
+                textAlign = TextAlign.Center,
+                modifier = Modifier.width(if (large) 11.dp else 8.dp)
+            )
+        }
+    }
+}
+
+@Composable
 private fun AngleRow(label: String, valueDeg: Float, modifier: Modifier = Modifier) {
     Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
         Text(label, modifier = Modifier.width(56.dp))
-        Text(
+        NumericText(
             text = formatDegrees(valueDeg),
-            style = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
-            textAlign = TextAlign.End,
-            modifier = Modifier.width(72.dp)
+            large = true,
+            modifier = Modifier.width(82.dp)
         )
     }
 }
 
 @Composable
 private fun TimingRow(sensorPeriodMs: Float?, commandPeriodMs: Float?, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        TimingMetric("Sensor", sensorPeriodMs)
+        TimingMetric("Send", commandPeriodMs, modifier = Modifier.padding(start = 18.dp))
+    }
+}
+
+@Composable
+private fun TimingMetric(label: String, valueMs: Float?, modifier: Modifier = Modifier) {
     Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
-        Text("Timing", modifier = Modifier.width(56.dp))
-        Text("sensor", style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(48.dp))
-        Text(formatMs(sensorPeriodMs), style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace), textAlign = TextAlign.End, modifier = Modifier.width(72.dp))
-        Text("send", style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(40.dp))
-        Text(formatMs(commandPeriodMs), style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace), textAlign = TextAlign.End, modifier = Modifier.width(72.dp))
+        Text(label, style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(48.dp))
+        NumericText(formatMs(valueMs), modifier = Modifier.width(80.dp))
     }
 }
 
 @Composable
 private fun ServoRow(item: ConnectedBleDevice, modifier: Modifier = Modifier) {
-    Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
-        Text("Servo", style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(44.dp))
-        listOf(item.servo0Us, item.servo1Us, item.servo2Us, item.servo3Us).forEachIndexed { index, value ->
-            Text("$index", style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(16.dp))
-            Text(formatUs(value), style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace), textAlign = TextAlign.End, modifier = Modifier.width(40.dp))
-            Text("us", style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(24.dp))
+    Column(modifier = modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Row(horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+            ServoValue("S0", item.servo0Us)
+            ServoValue("S1", item.servo1Us, modifier = Modifier.padding(start = 18.dp))
+        }
+        Row(modifier = Modifier.padding(top = 2.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+            ServoValue("S2", item.servo2Us)
+            ServoValue("S3", item.servo3Us, modifier = Modifier.padding(start = 18.dp))
         }
     }
 }
 
 @Composable
-private fun FeedbackRow(feedbackPeriodMs: Float?, sequenceStep: Int?, modifier: Modifier = Modifier) {
+private fun ServoValue(label: String, valueUs: Int?, modifier: Modifier = Modifier) {
     Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
+        Text(label, style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(22.dp))
+        NumericText(formatUs(valueUs), modifier = Modifier.width(38.dp))
+        Text(" us", style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(24.dp))
+    }
+}
+
+@Composable
+private fun FeedbackRow(item: ConnectedBleDevice, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
         Text("Feedback", style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(64.dp))
-        Text(formatMs(feedbackPeriodMs), style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace), textAlign = TextAlign.End, modifier = Modifier.width(72.dp))
-        Text(" seq step", style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(64.dp))
-        Text(formatStep(sequenceStep), style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace), textAlign = TextAlign.End, modifier = Modifier.width(24.dp))
+        NumericText(formatMs(item.feedbackPeriodMs), modifier = Modifier.width(80.dp))
+        Text("Seq", style = MaterialTheme.typography.bodySmall, modifier = Modifier.width(28.dp))
+        NumericText(formatStep(item.sequenceStep), modifier = Modifier.width(28.dp))
     }
 }
 
@@ -576,11 +735,14 @@ private fun relativeAngle(valueDeg: Float, zeroDeg: Float): Float {
     while (angle < -180f) angle += 360f
     return angle
 }
+private fun ConnectedBleDevice.hasServoFeedback(): Boolean =
+    servo0Us != null || servo1Us != null || servo2Us != null || servo3Us != null
+
 private fun degreesToCentiDegrees(value: Float): Int = (value * 100f).roundToInt().coerceIn(-32768, 32767)
-private fun formatDegrees(value: Float): String = "${(value * 10).roundToInt() / 10.0}°"
-private fun formatMs(value: Float?): String = value?.let { String.format("%5.1f ms", it) } ?: "   -- ms"
-private fun formatUs(value: Int?): String = value?.let { String.format("%4d", it) } ?: "  --"
-private fun formatStep(value: Int?): String = value?.let { String.format("%2d", it) } ?: "--"
+private fun formatDegrees(value: Float): String = String.format(Locale.US, "% 6.1f°", value)
+private fun formatMs(value: Float?): String = value?.let { String.format(Locale.US, "%6.1f ms", it) } ?: "    -- ms"
+private fun formatUs(value: Int?): String = value?.let { String.format(Locale.US, "%4d", it) } ?: "  --"
+private fun formatStep(value: Int?): String = value?.let { String.format(Locale.US, "%2d", it) } ?: "--"
 
 @Preview(showBackground = true)
 @Composable
